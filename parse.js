@@ -344,6 +344,35 @@ let hasLinks;     // whether any reference definition exists
 
 const last = a => a[a.length - 1];
 
+// Every inline token has this one shape, so the lexer and renderer see a single hidden class.
+class Tok {
+  constructor(type, raw, text, tokens) {
+    this.type = type;
+    this.raw = raw;
+    this.text = text;
+    this.tokens = tokens;
+    this.href = null;
+    this.title = null;
+    this.autolink = false;
+    this.escaped = false;
+    this.checked = false;
+  }
+}
+
+function textTok(raw, text, escaped) {
+  const t = new Tok('text', raw, text, null);
+  t.escaped = escaped;
+  return t;
+}
+
+function linkTok(type, raw, text, tokens, href, title, autolink) {
+  const t = new Tok(type, raw, text, tokens);
+  t.href = href;
+  t.title = title;
+  t.autolink = autolink;
+  return t;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Block lexer
 // ---------------------------------------------------------------------------------------------
@@ -363,9 +392,15 @@ function blockTokens(src, out, clipped) {
   let ulAt = -1, blAt = -1;
   while (src) {
     let t, tok, prev;
+    // Every rule up to the table one opens with up to 3 spaces and a fixed character (or with
+    // 4 spaces / a tab for indented code): look at that character once and skip rules that cannot match.
+    const c0 = src.charCodeAt(0);
+    let sp = 0;
+    while (sp < 4 && src.charCodeAt(sp) === 32) sp++;
+    const ch = sp < 4 ? src.charCodeAt(sp) : -1;
 
     // blank lines
-    if ((t = B_NEWLINE.exec(src)) && t[0].length > 0) {
+    if ((c0 === 32 || c0 === 9 || c0 === 10) && (t = B_NEWLINE.exec(src)) && t[0].length > 0) {
       src = src.substring(t[0].length);
       prev = out[out.length - 1];
       if (t[0].length === 1 && prev !== undefined) prev.raw += '\n';
@@ -374,7 +409,7 @@ function blockTokens(src, out, clipped) {
     }
 
     // indented code
-    if ((t = B_CODE.exec(src))) {
+    if ((sp === 4 || ch === 9) && (t = B_CODE.exec(src))) {
       const raw = trimBlankTail(t[0]);
       const text = raw.replace(/^(?: {0,3}\t| {1,4})/gm, '');
       src = src.substring(raw.length);
@@ -389,33 +424,33 @@ function blockTokens(src, out, clipped) {
       continue;
     }
 
-    if ((t = B_FENCES.exec(src))) {
+    if ((ch === 96 || ch === 126) && (t = B_FENCES.exec(src))) {
       const raw = t[0];
       src = src.substring(raw.length);
       out.push({ type: 'code', raw, lang: t[2] ? t[2].trim().replace(I_ANY_PUNCT, '$1') : t[2], text: fenceIndentFix(raw, t[3] || '') });
       continue;
     }
 
-    if ((tok = heading(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+    if (ch === 35 && (tok = heading(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
 
-    if ((t = B_HR.exec(src))) {
+    if ((ch === 45 || ch === 95 || ch === 42) && (t = B_HR.exec(src))) {
       const raw = rtrim(t[0], '\n');
       src = src.substring(raw.length);
       out.push({ type: 'hr', raw });
       continue;
     }
 
-    if ((tok = blockquote(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
-    if ((tok = list(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+    if (ch === 62 && (tok = blockquote(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+    if ((ch === 42 || ch === 43 || ch === 45 || (ch >= 48 && ch <= 57)) && (tok = list(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
 
-    if ((t = B_HTML.exec(src))) {
+    if (ch === 60 && (t = B_HTML.exec(src))) {
       const raw = trimBlankTail(t[0]);
       src = src.substring(raw.length);
       out.push({ type: 'html', raw, text: raw });
       continue;
     }
 
-    if ((tok = def(src))) {
+    if (ch === 91 && (tok = def(src))) {
       src = src.substring(tok.raw.length);
       prev = out[out.length - 1];
       if (prev !== undefined && (prev.type === 'paragraph' || prev.type === 'text')) {
@@ -601,6 +636,16 @@ function blockquote(src) {
   return { type: 'blockquote', raw, tokens, text };
 }
 
+// /\n[ \t]*\n[ \t]*$/.test(s)
+function endsWithBlankLine(s) {
+  let k = s.length;
+  while (k > 0 && (s.charCodeAt(k - 1) === 32 || s.charCodeAt(k - 1) === 9)) k--;
+  if (k === 0 || s.charCodeAt(k - 1) !== 10) return false;
+  k--;
+  while (k > 0 && (s.charCodeAt(k - 1) === 32 || s.charCodeAt(k - 1) === 9)) k--;
+  return k > 0 && s.charCodeAt(k - 1) === 10;
+}
+
 function list(src) {
   let t = B_LIST.exec(src);
   if (!t) return;
@@ -657,7 +702,7 @@ function list(src) {
     const itemRaw = whole.slice(startAt, whole.length - src.length);
     if (!lst.loose) {
       if (blankEnded) lst.loose = true;
-      else if (/\n[ \t]*\n[ \t]*$/.test(itemRaw)) blankEnded = true;
+      else if (endsWithBlankLine(itemRaw)) blankEnded = true;
     }
     lst.items.push({ raw: itemRaw, task: LIST_IS_TASK.test(body), loose: false, text: body, tokens: [], checked: undefined });
   }
@@ -685,7 +730,8 @@ function list(src) {
       }
       const k = /\[[ xX]\]/.exec(it.raw);
       if (k) {
-        const box = { type: 'checkbox', raw: k[0] + ' ', checked: k[0] !== '[ ]' };
+        const box = new Tok('checkbox', k[0] + ' ', '', null);
+        box.checked = k[0] !== '[ ]';
         it.checked = box.checked;
         if (lst.loose) {
           const f = it.tokens[0];
@@ -786,7 +832,7 @@ function isPlainInline(s) {
 
 function inlineTokens(src, out) {
   if (isPlainInline(src)) {
-    if (src) out.push({ type: 'text', raw: src, text: src, escaped: inRawBlock });
+    if (src) out.push(textTok(src, src, inRawBlock));
     return out;
   }
   const savedParen = parenOK;
@@ -830,7 +876,7 @@ function outputLink(cap, href, title, raw) {
     if (emitted) { inRawBlock = savedRaw; return; }
     linkEmitted = true;
   }
-  return { type: isImage ? 'image' : 'link', raw, href, title, text, tokens };
+  return linkTok(isImage ? 'image' : 'link', raw, text, tokens, href, title, false);
 }
 
 function lexLink(src) {
@@ -871,7 +917,7 @@ function lexReflink(src) {
   const ref = links[normLabel(n[2] || n[1])];
   if (!ref) {
     const c = n[0].charAt(0);
-    return { type: 'text', raw: c, text: c };
+    return textTok(c, c, false);
   }
   return outputLink(n, ref.href, ref.title, n[0]);
 }
@@ -919,10 +965,10 @@ function lexEmStrong(src, masked, prevChar, closers) {
     const raw = src.slice(0, k + m.index + lead + b);
     if (Math.min(k, b) % 2) {
       const text = raw.slice(1, -1);
-      return { type: 'em', raw, text, tokens: inlineTokens(text, []) };
+      return new Tok('em', raw, text, inlineTokens(text, []));
     }
     const text = raw.slice(2, -2);
-    return { type: 'strong', raw, text, tokens: inlineTokens(text, []) };
+    return new Tok('strong', raw, text, inlineTokens(text, []));
   }
 }
 
@@ -950,7 +996,7 @@ function lexDel(src, masked, prevChar, closers) {
     const lead = firstCpLen(m[0]);
     const raw = src.slice(0, k + m.index + lead + b);
     const text = raw.slice(k, -k);
-    return { type: 'del', raw, text, tokens: inlineTokens(text, []) };
+    return new Tok('del', raw, text, inlineTokens(text, []));
   }
 }
 
@@ -970,7 +1016,7 @@ function lexUrl(src) {
     text = t[0];
     href = t[1] === 'www.' ? 'http://' + t[0] : t[0];
   }
-  return { type: 'link', raw: t[0], text, href, title: null, autolink: true, tokens: null };
+  return linkTok('link', t[0], text, null, href, null, true);
 }
 
 function lexInline(src, out) {
@@ -987,7 +1033,7 @@ function lexInline(src, out) {
 
     if (c === 92 && (t = I_ESCAPE.exec(src))) {
       src = src.substring(t[0].length);
-      out.push({ type: 'escape', raw: t[0], text: t[1] });
+      out.push(new Tok('escape', t[0], t[1], null));
       continue;
     }
     if (c === 60 && (t = I_TAG.exec(src))) {
@@ -997,7 +1043,7 @@ function lexInline(src, out) {
       if (!inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(raw)) inRawBlock = true;
       else if (inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(raw)) inRawBlock = false;
       src = src.substring(raw.length);
-      out.push({ type: 'html', raw, text: raw });
+      out.push(new Tok('html', raw, raw, null));
       continue;
     }
     if (c === 91 || c === 33) {
@@ -1018,12 +1064,12 @@ function lexInline(src, out) {
       let text = t[2].replace(/\n/g, ' ');
       if (/[^ ]/.test(text) && text.startsWith(' ') && text.endsWith(' ')) text = text.substring(1, text.length - 1);
       src = src.substring(t[0].length);
-      out.push({ type: 'codespan', raw: t[0], text });
+      out.push(new Tok('codespan', t[0], text, null));
       continue;
     }
     if ((c === 32 || c === 92) && (t = I_BR.exec(src))) {
       src = src.substring(t[0].length);
-      out.push({ type: 'br', raw: t[0] });
+      out.push(new Tok('br', t[0], '', null));
       continue;
     }
     if (c === 126 && (tok = lexDel(src, masked, prevChar, closers))) {
@@ -1033,7 +1079,7 @@ function lexInline(src, out) {
       const text = t[1];
       const href = t[2] === '@' ? 'mailto:' + text : text;
       src = src.substring(t[0].length);
-      out.push({ type: 'link', raw: t[0], text, href, title: null, autolink: true, tokens: null });
+      out.push(linkTok('link', t[0], text, null, href, null, true));
       continue;
     }
     if (!inLink && isUrlStart(c) && (tok = lexUrl(src))) {
@@ -1049,7 +1095,7 @@ function lexInline(src, out) {
         p.raw += raw;
         p.text += inRawBlock ? raw : decodeNumRefs(raw);
       } else {
-        out.push({ type: 'text', raw, text: inRawBlock ? raw : decodeNumRefs(raw), escaped: inRawBlock });
+        out.push(textTok(raw, inRawBlock ? raw : decodeNumRefs(raw), inRawBlock));
       }
       continue;
     }
