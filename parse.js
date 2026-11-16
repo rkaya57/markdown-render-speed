@@ -964,6 +964,19 @@ function lexReflink(src) {
   return outputLink(n, ref.href, ref.title, n[0]);
 }
 
+// True when lexEmStrong surely returns nothing, decided without the mask: masking only ever
+// writes a + [ ] or `, so when the character before src (in full) is not the delimiter, the
+// masked run also starts here and the opener checks depend on prevChar alone.
+function emRejectsEarly(src, full, prevChar) {
+  const m = I_EM_LDELIM.exec(src);
+  if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return true;
+  const pos = full.length - src.length;
+  if (pos > 0 && full.charCodeAt(pos - 1) === src.charCodeAt(0)) return false;
+  if (m[4] && UNICODE_ALNUM.test(prevChar)) return true;
+  const d = m[1] || m[3] || '';
+  return !!(d && prevChar && !I_PUNCTUATION.exec(prevChar));
+}
+
 function lexEmStrong(src, masked, prevChar, closers) {
   let m = I_EM_LDELIM.exec(src);
   if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return;
@@ -1098,10 +1111,13 @@ function lexInline(src, out) {
         continue;
       }
     }
-    if ((c === 42 || c === 95 || c === 126) && masked === null) { masked = maskSrc(full); closers = closerPositions(masked); }
-    if ((c === 42 || c === 95) && (tok = lexEmStrong(src, masked, prevChar, closers))) {
-      src = src.substring(tok.raw.length); out.push(tok); continue;
+    if ((c === 42 || c === 95) && !emRejectsEarly(src, full, prevChar)) {
+      if (masked === null) { masked = maskSrc(full); closers = closerPositions(masked); }
+      if ((tok = lexEmStrong(src, masked, prevChar, closers))) {
+        src = src.substring(tok.raw.length); out.push(tok); continue;
+      }
     }
+    if (c === 126 && masked === null) { masked = maskSrc(full); closers = closerPositions(masked); }
     if (c === 96 && (t = I_CODE.exec(src))) {
       let text = t[2].replace(/\n/g, ' ');
       if (/[^ ]/.test(text) && text.startsWith(' ') && text.endsWith(' ')) text = text.substring(1, text.length - 1);
