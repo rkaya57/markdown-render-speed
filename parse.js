@@ -71,7 +71,10 @@ const FENCE_AT = byIndent(n => new RegExp(`^ {0,${n}}(?:\`\`\`|~~~)`));
 const HEADING_AT = byIndent(n => new RegExp(`^ {0,${n}}#{1,6}(?:\\s|$)`));
 const HTML_AT = byIndent(n => new RegExp(`^ {0,${n}}(?:</?(?:${TAGS})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i'));
 const BQ_AT = byIndent(n => new RegExp(`^ {0,${n}}>`));
-const clampIndent = n => (n < 1 ? 0 : n > 4 ? 3 : n - 1);
+// list item start for each kind of bullet: * + - and ordered with . or )
+const itemRegex = b => new RegExp(`^( {0,3}${b})((?:[\t ][^\\n]*)?(?:\\n|$))`);
+const ITEM_RE = { '*': itemRegex('\\*'), '+': itemRegex('\\+'), '-': itemRegex('\\-'), 'n.': itemRegex('\\d{1,9}\\.'), 'n)': itemRegex('\\d{1,9}\\)') };
+const clampIndent =n => (n < 1 ? 0 : n > 4 ? 3 : n - 1);
 
 // inline level
 const PUNCT = /[\p{P}\p{S}]/u;
@@ -209,6 +212,39 @@ function findClosing(s, open, close) {
   return depth > 0 ? -2 : -1;
 }
 
+// the text before the first line feed (all of s when there is none)
+function lineOf(s) {
+  const i = s.indexOf('\n');
+  return i === -1 ? s : s.slice(0, i);
+}
+
+// s with its leading blanks tab-expanded (marked's replace(/^[ \t]+/, expandTabs) idiom)
+function expandLead(s, col) {
+  let i = 0, tab = false;
+  for (; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9) tab = true;
+    else if (c !== 32) break;
+  }
+  return tab ? expandTabs(s.slice(0, i), col) + s.slice(i) : s;
+}
+
+// s.search(/[^ ]/)
+function firstNonSpace(s) {
+  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) !== 32) return i;
+  return -1;
+}
+
+// false when no ` {0,3}`-indented fence, heading, html, quote, bullet or rule can start this line
+function mayOpenBlock(s) {
+  const p = firstNonSpace(s);
+  if (p < 0 || p > 3) return false;
+  switch (s.charCodeAt(p)) {
+    case 96: case 126: case 35: case 60: case 62: case 42: case 43: case 45: case 95: return true;
+    default: { const c = s.charCodeAt(p); return c >= 48 && c <= 57; }
+  }
+}
+
 function expandTabs(s, col = 0) {
   let out = '';
   for (const ch of s) {
@@ -258,6 +294,7 @@ let inLink;
 let inRawBlock;
 let linkEmitted;
 let parenOK;      // marked's state.linkParenPossible
+let hasLinks;     // whether any reference definition exists
 
 const last = a => a[a.length - 1];
 
@@ -271,7 +308,13 @@ function inlineLater(src) {
   return tokens;
 }
 
+const UNDERLINE = /\n {0,3}[=-]/g;
+
 function blockTokens(src, out, clipped) {
+  // A setext heading needs a `\n {0,3}[=-]` line before the next "\n\n": track the next of each
+  // in `whole` (src is always a suffix of it) so the setext regex runs only where it can match.
+  const whole = src;
+  let ulAt = -1, blAt = -1;
   while (src) {
     let t, tok, prev;
 
@@ -334,7 +377,7 @@ function blockTokens(src, out, clipped) {
         prev.text += '\n' + tok.raw;
         last(queue).src = prev.text;
       } else {
-        if (!links[tok.tag]) links[tok.tag] = { href: tok.href, title: tok.title };
+        if (!links[tok.tag]) { links[tok.tag] = { href: tok.href, title: tok.title }; hasLinks = true; }
         out.push(tok);
       }
       continue;
@@ -342,7 +385,17 @@ function blockTokens(src, out, clipped) {
 
     if ((tok = table(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
 
-    if ((t = B_LHEADING.exec(src))) {
+    const off = whole.length - src.length;
+    if (ulAt < off) {
+      UNDERLINE.lastIndex = off;
+      const u = UNDERLINE.exec(whole);
+      ulAt = u === null ? Infinity : u.index;
+    }
+    if (blAt < off) {
+      const b = whole.indexOf('\n\n', off);
+      blAt = b === -1 ? Infinity : b;
+    }
+    if (ulAt < blAt && (t = B_LHEADING.exec(src))) {
       const text = t[1].trim();
       const raw = rtrim(t[0], '\n');
       src = src.substring(raw.length);
@@ -498,8 +551,7 @@ function list(src) {
   let bull = t[1].trim();
   const ordered = bull.length > 1;
   const lst = { type: 'list', raw: '', ordered, start: ordered ? +bull.slice(0, -1) : '', loose: false, items: [] };
-  bull = ordered ? `\\d{1,9}\\${bull.slice(-1)}` : `\\${bull}`;
-  const itemRe = new RegExp(`^( {0,3}${bull})((?:[\t ][^\\n]*)?(?:\\n|$))`);
+  const itemRe = ITEM_RE[ordered ? 'n' + bull.slice(-1) : bull];
   let blankEnded = false;
   while (src) {
     let endEarly = false;
@@ -507,10 +559,10 @@ function list(src) {
     if (!(t = itemRe.exec(src)) || B_HR.test(src)) break;
     const startAt = whole.length - src.length;
     src = src.substring(t[0].length);
-    const firstLine = t[2].split('\n', 1)[0];
+    const firstLine = lineOf(t[2]);
     const markerLen = t[1].length;
-    let line = firstLine.replace(/^[ \t]+/, v => expandTabs(v, markerLen));
-    let next = src.split('\n', 1)[0];
+    let line = expandLead(firstLine, markerLen);
+    let next = lineOf(src);
     let blank = !line.trim();
     let indent = 0;
     if (blank) indent = markerLen + 1;
@@ -529,11 +581,11 @@ function list(src) {
       const reBullet = NEXT_BULLET[ci], reHr = HR_AT[ci], reFence = FENCE_AT[ci];
       const reHeading = HEADING_AT[ci], reHtml = HTML_AT[ci], reQuote = BQ_AT[ci];
       while (src) {
-        const rawLine = src.split('\n', 1)[0];
+        const rawLine = lineOf(src);
         next = rawLine;
-        const expanded = next.replace(/^[ \t]+/, v => expandTabs(v));
-        if (reFence.test(next) || reHeading.test(next) || reHtml.test(next) || reQuote.test(next) || reBullet.test(next) || reHr.test(next)) break;
-        if (expanded.search(/[^ ]/) >= indent || !next.trim()) {
+        const expanded = expandLead(next, 0);
+        if (mayOpenBlock(next) && (reFence.test(next) || reHeading.test(next) || reHtml.test(next) || reQuote.test(next) || reBullet.test(next) || reHr.test(next))) break;
+        if (firstNonSpace(expanded) >= indent || !next.trim()) {
           body += '\n' + expanded.slice(indent);
         } else {
           if (blank || line.replace(/\t/g, '    ').search(/[^ ]/) >= 4 || reFence.test(line) || reHeading.test(line) || reHtml.test(line) || reHr.test(line)) break;
@@ -632,22 +684,28 @@ function maskReflink(r) {
 }
 
 function maskSrc(src) {
+  // each pass is skipped when the characters its pattern needs are absent (it could not match)
   let t = src;
-  if (src.includes('[')) t = t.replace(I_REFLINK_SEARCH, maskReflink);
-  t = t.replace(I_ANY_PUNCT_OUTSIDE_CODE, (m, ticks, esc) =>
-    esc ? '+'.repeat(m.length) : ticks ? ticks + m.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks : m);
-  t = t.replace(I_BLOCK_SKIP, (m, a, pre) => {
-    const o = pre ? pre.length : 0;
-    return m.slice(0, o) + '[' + 'a'.repeat(m.length - o - 2) + ']';
-  });
+  const bracket = src.includes('[');
+  if (bracket && hasLinks) t = t.replace(I_REFLINK_SEARCH, maskReflink);
+  const tick = src.includes('`');
+  if (tick || src.includes('\\')) {
+    t = t.replace(I_ANY_PUNCT_OUTSIDE_CODE, (m, ticks, esc) =>
+      esc ? '+'.repeat(m.length) : ticks ? ticks + m.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks : m);
+  }
+  if (bracket || tick || t.includes('<')) {
+    t = t.replace(I_BLOCK_SKIP, (m, a, pre) => {
+      const o = pre ? pre.length : 0;
+      return m.slice(0, o) + '[' + 'a'.repeat(m.length - o - 2) + ']';
+    });
+  }
   return t;
 }
 
 function inlineTokens(src, out) {
   const savedParen = parenOK;
   parenOK = savedParen && src.includes(')');
-  const masked = src.includes('*') || src.includes('_') || src.includes('~') ? maskSrc(src) : src;
-  lexInline(src, masked, closerPositions(masked), out);
+  lexInline(src, out);
   parenOK = savedParen;
   return out;
 }
@@ -829,7 +887,10 @@ function lexUrl(src) {
   return { type: 'link', raw: t[0], text, href, title: null, autolink: true, tokens: null };
 }
 
-function lexInline(src, masked, closers, out) {
+function lexInline(src, out) {
+  // the emphasis mask and closer positions are only needed once a * _ or ~ is reached
+  const full = src;
+  let masked = null, closers = null;
   let keepPrev = false;
   let prevChar = '';
   while (src) {
@@ -863,6 +924,7 @@ function lexInline(src, masked, closers, out) {
         continue;
       }
     }
+    if ((c === 42 || c === 95 || c === 126) && masked === null) { masked = maskSrc(full); closers = closerPositions(masked); }
     if ((c === 42 || c === 95) && (tok = lexEmStrong(src, masked, prevChar, closers))) {
       src = src.substring(tok.raw.length); out.push(tok); continue;
     }
@@ -1038,6 +1100,7 @@ export function parse(markdown) {
   inRawBlock = false;
   linkEmitted = false;
   parenOK = true;
+  hasLinks = false;
   const src = markdown.indexOf('\r') === -1 ? markdown : markdown.replace(/\r\n|\r/g, '\n');
   const tokens = blockTokens(src, [], false);
   for (let i = 0; i < queue.length; i++) {
