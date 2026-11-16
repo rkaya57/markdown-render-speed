@@ -88,8 +88,10 @@ const PUNCT_NO_TILDE = /(?!~)[\p{P}\p{S}]/u;
 const PUNCT_SPACE_NO_TILDE = /(?!~)[\s\p{P}\p{S}]/u;
 const NOT_PUNCT_SPACE_TILDE = /(?:[^\s\p{P}\p{S}]|~)/u;
 const I_BLOCK_SKIP = rx(/link|precode-code|html/, 'g')
-  .put('link', /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)/)
-  .put('precode-', '(?<!`)()').put('code', /(?<b>`+)[^`]+\k<b>(?!`)/).put('html', /<(?! )[^<>]*?>/).make();
+  // marked names these backtick groups (a, b); plain numbered groups match the same and keep
+  // V8's replace off its slow named-group path
+  .put('link', /\[(?:[^\[\]`]|(`+)[^`]+\1(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)/)
+  .put('precode-', '(?<!`)()').put('code', /(`+)[^`]+\3(?!`)/).put('html', /<(?! )[^<>]*?>/).make();
 const I_EM_LDELIM = rx(/^(?:\*+(?:((?!\*)punct)|([^\s*]))?)|^_+(?:((?!_)punct)|([^\s_]))?/, 'u').put(/punct/g, PUNCT_NO_TILDE).make();
 const I_EM_RDELIM_AST = rx('^[^_*]*?__[^_*]*?\\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\\*)punct(\\*+)(?=[\\s]|$)|notPunctSpace(\\*+)(?!\\*)(?=punctSpace|$)|(?!\\*)punctSpace(\\*+)(?=notPunctSpace)|[\\s](\\*+)(?!\\*)(?=punct)|(?!\\*)punct(\\*+)(?!\\*)(?=punct)|notPunctSpace(\\*+)(?=notPunctSpace)', 'gu')
   .put(/notPunctSpace/g, NOT_PUNCT_SPACE_TILDE).put(/punctSpace/g, PUNCT_SPACE_NO_TILDE).put(/punct/g, PUNCT_NO_TILDE).make();
@@ -151,7 +153,7 @@ function escAll(s) { return ESC_ALL_TEST.test(s) ? s.replace(ESC_ALL, escChar) :
 function escSoft(s) { return ESC_SOFT_TEST.test(s) ? s.replace(ESC_SOFT, escChar) : s; }
 
 function decodeNumRefs(s) {
-  if (!NUM_REF.test(s)) return s;
+  if (s.indexOf('&#') === -1 || !NUM_REF.test(s)) return s;
   return s.replace(NUM_REF_OR_AMP, (m, dec, hex) => {
     if (dec === undefined && hex === undefined) return '&amp;';
     const cp = dec === undefined ? Number.parseInt(hex, 16) : Number.parseInt(dec, 10);
@@ -160,7 +162,51 @@ function decodeNumRefs(s) {
   });
 }
 
+// [...s].length
+function cpCount(s) {
+  let n = s.length;
+  for (let i = 0; i < s.length - 1; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) { n--; i++; }
+    }
+  }
+  return n;
+}
+
+// [...s][0].length (s non-empty)
+function firstCpLen(s) {
+  const c = s.charCodeAt(0);
+  if (c >= 0xd800 && c <= 0xdbff && s.length > 1) {
+    const d = s.charCodeAt(1);
+    if (d >= 0xdc00 && d <= 0xdfff) return 2;
+  }
+  return 1;
+}
+
+// [...s].at(-1) ?? '' for a string of at most two code units
+function lastCodePoint(s) {
+  if (s.length < 2) return s;
+  const c = s.charCodeAt(0), d = s.charCodeAt(1);
+  if (c >= 0xd800 && c <= 0xdbff && d >= 0xdc00 && d <= 0xdfff) return s;
+  return s[1];
+}
+
+// characters encodeURI keeps as they are, and %, which cleanUrl's replace restores
+function uriSafe(c) {
+  if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)) return true;
+  switch (c) {
+    case 59: case 44: case 47: case 63: case 58: case 64: case 38: case 61: case 43: case 36: case 45:
+    case 95: case 46: case 33: case 126: case 42: case 39: case 40: case 41: case 35: case 37: return true;
+  }
+  return false;
+}
+
 function cleanUrl(href) {
+  let i = 0;
+  while (i < href.length && uriSafe(href.charCodeAt(i))) i++;
+  if (i === href.length) return href;
   try { return encodeURI(href).replace(/%25/g, '%'); } catch { return null; }
 }
 
@@ -308,7 +354,7 @@ function inlineLater(src) {
   return tokens;
 }
 
-const UNDERLINE = /\n {0,3}[=-]/g;
+const UNDERLINE = /\n {0,3}(?:=+|-+)[ \t]*(?:\n|$)/g;
 
 function blockTokens(src, out, clipped) {
   // A setext heading needs a `\n {0,3}[=-]` line before the next "\n\n": track the next of each
@@ -321,7 +367,7 @@ function blockTokens(src, out, clipped) {
     // blank lines
     if ((t = B_NEWLINE.exec(src)) && t[0].length > 0) {
       src = src.substring(t[0].length);
-      prev = last(out);
+      prev = out[out.length - 1];
       if (t[0].length === 1 && prev !== undefined) prev.raw += '\n';
       else out.push({ type: 'space', raw: t[0] });
       continue;
@@ -332,11 +378,11 @@ function blockTokens(src, out, clipped) {
       const raw = trimBlankTail(t[0]);
       const text = raw.replace(/^(?: {0,3}\t| {1,4})/gm, '');
       src = src.substring(raw.length);
-      prev = last(out);
+      prev = out[out.length - 1];
       if (prev !== undefined && (prev.type === 'paragraph' || prev.type === 'text')) {
         prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + raw;
         prev.text += '\n' + text;
-        last(queue).src = prev.text;
+        queue[queue.length - 1].src = prev.text;
       } else {
         out.push({ type: 'code', raw, lang: undefined, text });
       }
@@ -371,11 +417,11 @@ function blockTokens(src, out, clipped) {
 
     if ((tok = def(src))) {
       src = src.substring(tok.raw.length);
-      prev = last(out);
+      prev = out[out.length - 1];
       if (prev !== undefined && (prev.type === 'paragraph' || prev.type === 'text')) {
         prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + tok.raw;
         prev.text += '\n' + tok.raw;
-        last(queue).src = prev.text;
+        queue[queue.length - 1].src = prev.text;
       } else {
         if (!links[tok.tag]) { links[tok.tag] = { href: tok.href, title: tok.title }; hasLinks = true; }
         out.push(tok);
@@ -407,12 +453,12 @@ function blockTokens(src, out, clipped) {
       const raw = t[0];
       const text = t[1].charAt(t[1].length - 1) === '\n' ? t[1].slice(0, -1) : t[1];
       const tokens = inlineLater(text);
-      prev = last(out);
+      prev = out[out.length - 1];
       if (clipped && prev !== undefined && prev.type === 'paragraph') {
         prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + raw;
         prev.text += '\n' + text;
         queue.pop();
-        last(queue).src = prev.text;
+        queue[queue.length - 1].src = prev.text;
       } else {
         out.push({ type: 'paragraph', raw, text, tokens });
       }
@@ -425,12 +471,12 @@ function blockTokens(src, out, clipped) {
       const raw = t[0];
       src = src.substring(raw.length);
       const tokens = inlineLater(raw);
-      prev = last(out);
+      prev = out[out.length - 1];
       if (prev !== undefined && prev.type === 'text') {
         prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + raw;
         prev.text += '\n' + raw;
         queue.pop();
-        last(queue).src = prev.text;
+        queue[queue.length - 1].src = prev.text;
       } else {
         out.push({ type: 'text', raw, text: raw, tokens });
       }
@@ -464,7 +510,18 @@ function def(src) {
   return { type: 'def', tag, raw: rtrim(t[0], '\n'), href, title };
 }
 
+// B_TABLE needs its second line to open (after up to 3 spaces) with | : or -
+function tablePossible(src) {
+  let i = src.indexOf('\n');
+  if (i === -1) return false;
+  i++;
+  for (let k = 0; k < 3 && src.charCodeAt(i) === 32; k++) i++;
+  const c = src.charCodeAt(i);
+  return c === 124 || c === 58 || c === 45;
+}
+
 function table(src) {
+  if (!tablePossible(src)) return;
   const t = B_TABLE.exec(src);
   if (!t || !/[:|]/.test(t[2])) return;
   const head = splitCells(t[1]);
@@ -702,7 +759,36 @@ function maskSrc(src) {
   return t;
 }
 
+// True when no inline rule but text can match anywhere in s: none of \ < [ ! * _ ~ ` & @ :, no
+// "www." and no hard break ("  \n"). The inline lexer then yields one text token holding s.
+function isPlainInline(s) {
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c > 126) continue;
+    switch (c) {
+      case 92: case 60: case 91: case 33: case 42: case 95: case 126: case 96: case 38: case 64: case 58:
+        return false;
+      case 32:
+        if (s.charCodeAt(i + 1) === 32) {
+          let j = i + 2;
+          while (s.charCodeAt(j) === 32) j++;
+          if (s.charCodeAt(j) === 10) return false;
+        }
+        break;
+      case 119:
+        if (s.startsWith('www.', i)) return false;
+        break;
+    }
+  }
+  return true;
+}
+
 function inlineTokens(src, out) {
+  if (isPlainInline(src)) {
+    if (src) out.push({ type: 'text', raw: src, text: src, escaped: inRawBlock });
+    return out;
+  }
   const savedParen = parenOK;
   parenOK = savedParen && src.includes(')');
   lexInline(src, out);
@@ -798,14 +884,14 @@ function lexEmStrong(src, masked, prevChar, closers) {
   const pos = masked.length - src.length;
   let l = pos;
   while (l > 0 && masked[l - 1] === ch) l--;
-  const before = [...masked.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
+  const before = lastCodePoint(masked.slice(Math.max(0, l - 2), l));
   const beforePunct = before === '*' || before === '_' || !!I_PUNCTUATION.exec(before);
   if (l < pos) prevChar = before;
   const prevPunct = l < pos ? beforePunct : !!I_PUNCTUATION.exec(prevChar);
   if (m[4] && UNICODE_ALNUM.test(prevChar)) return;
   const d = m[1] || m[3] || '';
   if (d && prevChar && !prevPunct) return;
-  const k = [...m[0]].length - 1;
+  const k = cpCount(m[0]) - 1;
   let g, b, need = k, carried = 0;
   const runLen = pos - l + k;
   const strict = !!before.trim() && (!!d || (ch === '*' && !beforePunct));
@@ -820,7 +906,7 @@ function lexEmStrong(src, masked, prevChar, closers) {
   while ((m = re.exec(hay)) !== null && !(m.index > limit)) {
     g = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
     if (!g) continue;
-    b = [...g].length;
+    b = cpCount(g);
     if (m[3] || m[4]) { need += b; continue; }
     else if (m[5] || m[6] || strict) {
       if (prevSame && (m[5] || m[6])) break;
@@ -829,7 +915,7 @@ function lexEmStrong(src, masked, prevChar, closers) {
     need -= b;
     if (need > 0) continue;
     b = Math.min(b, b + need + carried);
-    const lead = [...m[0]][0].length;
+    const lead = firstCpLen(m[0]);
     const raw = src.slice(0, k + m.index + lead + b);
     if (Math.min(k, b) % 2) {
       const text = raw.slice(1, -1);
@@ -844,7 +930,7 @@ function lexDel(src, masked, prevChar, closers) {
   let m = I_DEL_LDELIM.exec(src);
   if (!m) return;
   if ((m[1] || '') && prevChar && !I_PUNCTUATION.exec(prevChar)) return;
-  const k = [...m[0]].length - 1;
+  const k = cpCount(m[0]) - 1;
   let need = k;
   const lastCloser = closers.tilde;
   const from = masked.length - src.length + k;
@@ -855,13 +941,13 @@ function lexDel(src, masked, prevChar, closers) {
   while ((m = I_DEL_RDELIM.exec(hay)) !== null && !(m.index > limit)) {
     const g = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
     if (!g) continue;
-    let b = [...g].length;
+    let b = cpCount(g);
     if (b !== k) continue;
     if (m[3] || m[4]) { need += b; continue; }
     need -= b;
     if (need > 0) continue;
     b = Math.min(b, b + need);
-    const lead = [...m[0]][0].length;
+    const lead = firstCpLen(m[0]);
     const raw = src.slice(0, k + m.index + lead + b);
     const text = raw.slice(k, -k);
     return { type: 'del', raw, text, tokens: inlineTokens(text, []) };
@@ -918,7 +1004,7 @@ function lexInline(src, out) {
       if ((tok = lexLink(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
       if ((tok = lexReflink(src))) {
         src = src.substring(tok.raw.length);
-        const p = last(out);
+        const p = out[out.length - 1];
         if (tok.type === 'text' && p !== undefined && p.type === 'text') { p.raw += tok.raw; p.text += tok.text; }
         else out.push(tok);
         continue;
@@ -958,7 +1044,7 @@ function lexInline(src, out) {
       src = src.substring(raw.length);
       if (raw.charCodeAt(raw.length - 1) !== 95) prevChar = raw.slice(-1);
       keepPrev = true;
-      const p = last(out);
+      const p = out[out.length - 1];
       if (p !== undefined && p.type === 'text') {
         p.raw += raw;
         p.text += inRawBlock ? raw : decodeNumRefs(raw);
