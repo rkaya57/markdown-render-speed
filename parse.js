@@ -149,8 +149,50 @@ const ESC_ALL_TEST = /[&<>"']/;
 const ESC_ALL = /[&<>"']/g;
 const ESC_SOFT_TEST = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
 const ESC_SOFT = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
-function escAll(s) { return ESC_ALL_TEST.test(s) ? s.replace(ESC_ALL, escChar) : s; }
-function escSoft(s) { return ESC_SOFT_TEST.test(s) ? s.replace(ESC_SOFT, escChar) : s; }
+function escAll(s) { return ESC_ALL_TEST.test(s) ? escapeScan(s, true) : s; }
+function escSoft(s) { return ESC_SOFT_TEST.test(s) ? escapeScan(s, false) : s; }
+
+const isDigit = c => c >= 48 && c <= 57;
+const isHex = c => (c >= 48 && c <= 57) || ((c | 32) >= 97 && (c | 32) <= 102);
+const isWord = c => (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95;
+
+// s.slice(j) starts with (#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);
+function entityAt(s, j) {
+  const n = s.length;
+  let k;
+  if (s.charCodeAt(j) === 35) {
+    k = j + 1;
+    while (k < n && isDigit(s.charCodeAt(k))) k++;
+    if (k - j - 1 >= 1 && k - j - 1 <= 7 && s.charCodeAt(k) === 59) return true;
+    if ((s.charCodeAt(j + 1) | 32) !== 120) return false;
+    k = j + 2;
+    while (k < n && isHex(s.charCodeAt(k))) k++;
+    return k - j - 2 >= 1 && k - j - 2 <= 6 && s.charCodeAt(k) === 59;
+  }
+  k = j;
+  while (k < n && isWord(s.charCodeAt(k))) k++;
+  return k > j && s.charCodeAt(k) === 59;
+}
+
+// one pass of the ESC_ALL (all) or ESC_SOFT (& only when it starts no entity) replacement
+function escapeScan(s, all) {
+  let out = '', from = 0;
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    let r;
+    switch (s.charCodeAt(i)) {
+      case 38: if (!all && entityAt(s, i + 1)) continue; r = '&amp;'; break;
+      case 60: r = '&lt;'; break;
+      case 62: r = '&gt;'; break;
+      case 34: r = '&quot;'; break;
+      case 39: r = '&#39;'; break;
+      default: continue;
+    }
+    out += s.slice(from, i) + r;
+    from = i + 1;
+  }
+  return from === 0 ? s : out + s.slice(from);
+}
 
 function decodeNumRefs(s) {
   if (s.indexOf('&#') === -1 || !NUM_REF.test(s)) return s;
